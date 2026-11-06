@@ -1,0 +1,126 @@
+name: Build and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@68827325e0b33c7199eb31dd4e31fbe9023e06e3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+
+      - name: Run application tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Check release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: test "$RELEASE_TAG" = "v$(tr -d '\r\n' < VERSION)"
+
+      - name: Build and run ARM64 image checks
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -eu
+          VERSION="$(tr -d '\r\n' < VERSION)"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$GITHUB_SHA")"
+          docker buildx build \
+            --platform linux/arm64 \
+            --load \
+            --provenance=false \
+            --build-arg APP_VERSION="$VERSION" \
+            --build-arg VCS_REF="$SOURCE_REVISION" \
+            --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            --tag "aoscx-container-healthcheck:$VERSION" .
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "aoscx-container-healthcheck:$VERSION")" = "linux/arm64"
+          test "$(docker image inspect --format '{{.Config.User}}' "aoscx-container-healthcheck:$VERSION")" = "65532:65532"
+          test -z "$(docker image inspect --format '{{json .Config.ExposedPorts}}' "aoscx-container-healthcheck:$VERSION" | grep -v '^null$' | grep -v '^\[\]$' || true)"
+          docker image inspect --format '{{json .Config.Env}}' "aoscx-container-healthcheck:$VERSION" | python3 -c 'import json,re,sys; env=json.load(sys.stdin) or []; bad=[item.partition("=")[0] for item in env if re.search(r"(SECRET|TOKEN|PASSWORD|API_KEY|PRIVATE_KEY|CREDENTIAL)", item.partition("=")[0], re.I)]; print("Sensitive environment variable names found: " + ", ".join(bad), file=sys.stderr) if bad else None; sys.exit(bool(bad))'
+          docker run --rm --platform linux/arm64 --network none --read-only --cap-drop=ALL --security-opt=no-new-privileges --memory=128m --cpus=0.1 "aoscx-container-healthcheck:$VERSION" --check
+
+      - name: Export generic OCI archive
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -eu
+          VERSION="$(tr -d '\r\n' < VERSION)"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$GITHUB_SHA")"
+          mkdir -p dist
+          ARCHIVE="dist/aoscx-container-lab-$VERSION-linux-arm64.oci.tar"
+          docker buildx build \
+            --platform linux/arm64 \
+            --provenance=false \
+            --build-arg APP_VERSION="$VERSION" \
+            --build-arg VCS_REF="$SOURCE_REVISION" \
+            --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            --output "type=oci,dest=$ARCHIVE,rewrite-timestamp=true" .
+          python3 scripts/validate_oci.py "$ARCHIVE" --version "$VERSION"
+          python3 - "$ARCHIVE" "$VERSION" "$SOURCE_REVISION" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          archive, version, revision = sys.argv[1:]
+          metadata = {
+              "artifact": Path(archive).name,
+              "architecture": "arm64",
+              "format": "OCI image archive",
+              "aoscx_deployable": False,
+              "aoscx_format_status": "unverified; see README deployment blocker",
+              "source_revision": revision,
+              "version": version,
+          }
+          Path("dist/release-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="ascii")
+          PY
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - name: Upload release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Verify checksums and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          cd dist
+          sha256sum --check *.sha256
+          if find . -maxdepth 1 -name '*.img' | grep -q .; then
+            echo 'Refusing to publish an unverified switch image.' >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" ./* --title "AOS-CX Container Lab $RELEASE_TAG" \
+            --notes "Generic ARM64 OCI release only. This is not a deployable AOS-CX .img; see README for the HPE format and manifest blocker."
